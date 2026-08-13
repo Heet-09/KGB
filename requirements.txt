@@ -1,0 +1,16 @@
+kuzu>=0.11.0
+typer>=0.27.0
+rich>=13.0.0
+
+# Local embedding model (ONNX Runtime, not PyTorch - much smaller install)
+# for semantic search in `ask`/`serve` (see embeddings.py, db.vector_search).
+# Downloads its model (~130MB) from Hugging Face on first use, then runs
+# fully offline. If not installed, indexing/Ask still work - retrieval
+# just falls back to TF-IDF alone (see retrieval.rank_context).
+fastembed>=0.3.0
+
+# Optional: only needed to index PHP files (see php_parser.py). Python-only
+# repos never import these - `index` just skips .php files with a hint if
+# they're missing.
+tree-sitter>=0.24.0
+tree-sitter-php>=0.24.0
