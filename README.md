@@ -154,3 +154,4 @@ here is a direct, working version of "change impact analysis," and the
 `ask` command's context-window size (compare `len(context)` vs. raw file
 size) is a real, measurable stand-in for the token-saving baseline that
 was flagged as missing from the KGB plan.
+# KGB
