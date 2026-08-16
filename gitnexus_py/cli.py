@@ -29,9 +29,13 @@ from .viz import render_html
 from .obsidian import export_vault
 from .web import run_server, _ask
 from . import rbac_extractor
+from . import docgen
 
 app = typer.Typer(add_completion=False, help="GitNexus-py: local code knowledge graph")
 console = Console()
+
+docs_app = typer.Typer(add_completion=False, help="Generate MkDocs-style documentation from the graph")
+app.add_typer(docs_app, name="docs")
 
 DEFAULT_DB = "./gitnexus.db"
 
@@ -297,6 +301,43 @@ def ask(question: str = typer.Argument(..., help="Natural language question abou
             continue
         console.print(result["content"])
         return
+
+
+@docs_app.command("generate")
+def docs_generate(
+    db: str = typer.Option(DEFAULT_DB, "--db"),
+    output: str = typer.Option("./docs", "--output", help="Directory to write generated docs into"),
+    incremental: bool = typer.Option(
+        False, "--incremental",
+        help="Only regenerate chapters whose node set/content changed since the last run "
+             f"(tracked in <output>/{docgen.MANIFEST_FILENAME}).",
+    ),
+    model: str = typer.Option("llama-3.3-70b-versatile", "--model"),
+    max_chapter_nodes: int = typer.Option(
+        40, "--max-chapter-nodes",
+        help="Deterministically split a connected cluster larger than this into multiple chapters",
+    ),
+):
+    """Walk the already-indexed graph (no user question involved) and
+    generate module/chapter Markdown docs + an mkdocs.yml, grouped by
+    file-path module and clustered into chapters by cross-file
+    CALLS/INHERITS density (see clustering.py). Requires GROQ_API_KEY.
+    Run `mkdocs build` or `mkdocs serve` in --output afterward to render
+    the static site (mkdocs itself isn't a dependency of this tool)."""
+    if not os.environ.get("GROQ_API_KEY"):
+        console.print("[red]GROQ_API_KEY not set.[/red] export GROQ_API_KEY=... and retry.")
+        raise typer.Exit(1)
+
+    _, conn = open_db(db, fresh=False)
+    console.print(f"[bold]Clustering & generating docs[/bold] into {output} "
+                  f"({'incremental' if incremental else 'full'}) ...")
+    result = docgen.generate_docs(conn, output_dir=output, incremental=incremental,
+                                   model=model, max_chapter_nodes=max_chapter_nodes)
+    console.print(
+        f"[green]Done.[/green] {result['modules']} module(s), {result['chapters']} chapter(s): "
+        f"{result['written']} written, {result['reused']} reused, {result['deleted']} deleted."
+    )
+    console.print(f"[dim]Open {output}/mkdocs.yml with `mkdocs serve` (pip install mkdocs) to view it.[/dim]")
 
 
 if __name__ == "__main__":

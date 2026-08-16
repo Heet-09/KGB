@@ -213,6 +213,17 @@ _PAGE = """<!doctype html>
     font-size: 18px; line-height: 1; }
   #summaryPanel .body { white-space: pre-wrap; line-height: 1.6; font-size: 13px; }
 
+  #docsTree .mod { font-weight: 700; margin-top: 10px; font-size: 12px; text-transform: uppercase;
+    letter-spacing: .03em; color: var(--muted); }
+  #docsTree .mod:first-child { margin-top: 0; }
+  #docsTree .chap { display: block; width: 100%; text-align: left; background: none; border: none;
+    color: var(--text); padding: 5px 6px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  #docsTree .chap:hover { background: var(--panel-2); }
+  #docsTree .chap.active { background: var(--accent); color: #fff; }
+  #docsChapter .md-body { white-space: pre-wrap; line-height: 1.6; font-size: 13.5px; }
+  #docsChapter .md-path { color: var(--muted); font-size: 11px; font-family: ui-monospace, Consolas, monospace;
+    margin-bottom: 10px; }
+
   #repoSelect { font-size: 13px; padding: 5px 8px; max-width: 220px; }
   #addRepoBtn { white-space: nowrap; }
   #uploadOverlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: none;
@@ -237,6 +248,7 @@ _PAGE = """<!doctype html>
       <button data-view="explore">Explore</button>
       <button data-view="graph">Graph</button>
       <button data-view="ask">Ask</button>
+      <button data-view="docs">Docs</button>
       <button data-view="cypher">Cypher</button>
     </nav>
   </header>
@@ -332,6 +344,32 @@ _PAGE = """<!doctype html>
           <textarea id="askInput" placeholder="What breaks if I change get_app_url? (Enter to send, Shift+Enter for a new line)" style="min-height:44px"></textarea>
           <button class="primary" id="askBtn">Send</button>
           <button class="chat-clear" id="askClearBtn">Clear history</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-docs" class="view wide">
+      <div class="card">
+        <h2>Module &amp; chapter docs</h2>
+        <p class="hint">Walks the whole graph (no question involved) and generates Markdown
+          documentation per module/chapter, clustered by cross-file call/inherit density - see
+          <code class="inline">docgen.py</code>. Requires <code class="inline">GROQ_API_KEY</code>.
+          First run generates everything; later runs can go <b>incremental</b> and only
+          regenerate chapters whose code actually changed.</p>
+        <div class="row">
+          <button class="primary" id="docsGenBtn">Generate docs</button>
+          <label style="display:flex; align-items:center; gap:6px; font-size:13px; color:var(--muted)">
+            <input type="checkbox" id="docsIncremental" checked> incremental
+          </label>
+          <span class="hint" id="docsStatus"></span>
+        </div>
+      </div>
+      <div class="card" style="display:flex; gap:16px; align-items:stretch">
+        <div style="flex: 0 0 240px; border-right: 1px solid var(--border); padding-right: 14px; overflow:auto; max-height: calc(100vh - 320px)">
+          <div id="docsTree" class="empty">No docs generated yet - click "Generate docs" above.</div>
+        </div>
+        <div style="flex:1; min-width:0; overflow:auto; max-height: calc(100vh - 320px)">
+          <div id="docsChapter" class="empty">Pick a chapter on the left to preview it.</div>
         </div>
       </div>
     </section>
@@ -559,6 +597,73 @@ document.getElementById('askClearBtn').addEventListener('click', () => {
   document.getElementById('askInput').placeholder =
     'What breaks if I change get_app_url? (Enter to send, Shift+Enter for a new line)';
 });
+
+// ---------------------------------------------------------------- docs ----
+let docsManifest = null;
+
+async function loadDocsList() {
+  const tree = document.getElementById('docsTree');
+  try {
+    const r = await api('/api/docs/list');
+    docsManifest = r.modules;
+    renderDocsTree();
+  } catch (e) {
+    tree.innerHTML = `<div class="error">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderDocsTree() {
+  const tree = document.getElementById('docsTree');
+  const modules = docsManifest || {};
+  const names = Object.keys(modules).sort();
+  if (!names.length) {
+    tree.innerHTML = '<div class="empty">No docs generated yet - click "Generate docs" above.</div>';
+    return;
+  }
+  tree.innerHTML = names.map(mod => {
+    const chapters = modules[mod].slice().sort((a, b) => a.title.localeCompare(b.title));
+    return `<div class="mod">${escapeHtml(mod)}</div>` + chapters.map(c =>
+      `<button class="chap" data-path="${escapeHtml(c.output_path)}">${escapeHtml(c.title)}</button>`
+    ).join('');
+  }).join('');
+  tree.querySelectorAll('.chap').forEach(btn => {
+    btn.addEventListener('click', () => openDocsChapter(btn.dataset.path, btn));
+  });
+}
+
+async function openDocsChapter(path, btnEl) {
+  document.querySelectorAll('#docsTree .chap').forEach(b => b.classList.remove('active'));
+  if (btnEl) btnEl.classList.add('active');
+  const body = document.getElementById('docsChapter');
+  body.innerHTML = '<div class="spinner">Loading...</div>';
+  try {
+    const r = await api('/api/docs/chapter?path=' + encodeURIComponent(path));
+    body.innerHTML = `<div class="md-path">${escapeHtml(path)}</div><div class="md-body">${escapeHtml(r.content)}</div>`;
+  } catch (e) {
+    body.innerHTML = `<div class="error">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+document.getElementById('docsGenBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('docsGenBtn');
+  const status = document.getElementById('docsStatus');
+  const incremental = document.getElementById('docsIncremental').checked;
+  btn.disabled = true;
+  status.textContent = 'Generating - this calls the LLM per new/changed chapter, can take a while...';
+  try {
+    const r = await api('/api/docs/generate', { method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ incremental }) });
+    status.textContent = `Done: ${r.modules} module(s), ${r.chapters} chapter(s) - ` +
+      `${r.written} written, ${r.reused} reused, ${r.deleted} deleted.`;
+    await loadDocsList();
+  } catch (e) {
+    status.innerHTML = `<span class="error">${escapeHtml(e.message)}</span>`;
+  } finally { btn.disabled = false; }
+});
+
+const docsNavBtn = document.querySelector('nav button[data-view="docs"]');
+let docsLoaded = false;
+docsNavBtn.addEventListener('click', () => { if (!docsLoaded) { docsLoaded = true; loadDocsList(); } });
 
 // ------------------------------------------------------------- cypher ----
 document.getElementById('cypherBtn').addEventListener('click', async () => {
@@ -886,6 +991,49 @@ def _resolve_function_name(conn: kuzu.Connection, query: str) -> tuple[str, str 
     return query, None
 
 
+def _docs_dir(db_path: str) -> str:
+    """Where the Docs tab reads/writes generated chapters + docs_manifest.json
+    for a given repo's DB - a sidecar directory next to the db file, same
+    convention as cli._manifest_path's `.manifest.json`, so each indexed
+    repo gets its own docs output that doesn't collide with another repo's."""
+    return db_path.rstrip("/\\") + ".docs"
+
+
+def _docs_list(db_path: str) -> dict:
+    """Reads docs_manifest.json (written by docgen.generate_docs) and
+    reshapes it into {module: [{chapter_id, title, output_path}, ...]} -
+    what the dashboard's Docs tab tree renders. Returns {} if docs haven't
+    been generated yet for this repo."""
+    manifest_path = Path(_docs_dir(db_path)) / "docs_manifest.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    modules: dict[str, list[dict]] = {}
+    for chapter_id, entry in manifest.get("chapters", {}).items():
+        title = chapter_id.split("/", 1)[-1].replace("-", " ").title()
+        modules.setdefault(entry["module"], []).append({
+            "chapter_id": chapter_id, "title": title, "output_path": entry["output_path"],
+        })
+    return modules
+
+
+def _docs_read_chapter(db_path: str, rel_path: str) -> str:
+    """Reads one generated chapter's Markdown, guarding against the `path`
+    query param escaping the docs dir (e.g. `../../secret`) - resolves
+    both and checks containment before reading."""
+    docs_dir = Path(_docs_dir(db_path)).resolve()
+    target = (docs_dir / rel_path).resolve()
+    if docs_dir not in target.parents and target != docs_dir:
+        raise RuntimeError("invalid path")
+    if not target.exists():
+        raise RuntimeError("chapter not found - generate docs first")
+    return target.read_text(encoding="utf-8")
+
+
 def _registry_path() -> Path:
     """Where the dashboard's list of known repos (name + db path) lives -
     a small JSON file in the current directory, so the repo dropdown
@@ -1042,6 +1190,13 @@ def make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                     self._send_json({"rows": get_impact(state.conn, name, max_hops=hops), "resolved_name": resolved})
                 elif parsed.path == "/api/repos":
                     self._send_json({"repos": _load_registry(), "active": str(Path(state.db_path).resolve())})
+                elif parsed.path == "/api/docs/list":
+                    self._send_json({"modules": _docs_list(state.db_path)})
+                elif parsed.path == "/api/docs/chapter":
+                    path = (qs.get("path") or [""])[0]
+                    if not path:
+                        raise RuntimeError("path required")
+                    self._send_json({"content": _docs_read_chapter(state.db_path, path)})
                 else:
                     self._send_json({"error": "not found"}, status=404)
             except Exception as exc:  # noqa: BLE001 - surface any DB/query error to the UI
@@ -1059,6 +1214,13 @@ def make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                     self._send_json(_ask(state.conn, body.get("question", ""), body.get("model"), body.get("history")))
                 elif parsed.path == "/api/summarize":
                     self._send_json({"summary": _summarize(state.conn, body.get("model"))})
+                elif parsed.path == "/api/docs/generate":
+                    from . import docgen  # lazy import - docgen imports from this module
+                    result = docgen.generate_docs(
+                        state.conn, output_dir=_docs_dir(state.db_path),
+                        incremental=bool(body.get("incremental", True)), model=body.get("model"),
+                    )
+                    self._send_json(result)
                 elif parsed.path == "/api/switch-repo":
                     db_path = body.get("db_path", "")
                     if not db_path:

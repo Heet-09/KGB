@@ -368,6 +368,96 @@ def list_concepts(conn: kuzu.Connection, kind: str | None = None) -> list[dict]:
     return df.to_dict(orient="records")
 
 
+def get_module_prefixes(conn: kuzu.Connection) -> list[str]:
+    """Distinct top-level path segments across Module/Class/Function nodes -
+    the module boundaries `docs generate` walks. Kuzu has no native
+    "distinct prefix" op, so this pulls every file path once and derives
+    the prefix in Python (same first-segment rule as web._top_folder)."""
+    prefixes: set[str] = set()
+    for kind in ("Module", "Class", "Function"):
+        df = conn.execute(f"MATCH (n:{kind}) RETURN n.file AS file").get_as_df()
+        for file in df["file"].tolist():
+            norm = str(file or "").replace("\\", "/").strip("/")
+            prefixes.add(norm.split("/", 1)[0] if norm else "(root)")
+    return sorted(prefixes)
+
+
+def get_nodes_by_file_prefix(conn: kuzu.Connection, prefix: str) -> list[dict]:
+    """Every Class/Function node whose file falls under a module's
+    top-level path segment - the node set a chapter is clustered from.
+    Filtered in Python (not a Cypher STARTS WITH) because `file` is stored
+    with the OS-native separator it was indexed on (e.g. backslash on
+    Windows), matching get_module_prefixes' own normalize-then-split-on-
+    first-segment logic exactly rather than assuming '/' in the DB."""
+    nodes: list[dict] = []
+    for kind in ("Class", "Function"):
+        df = conn.execute(
+            f"MATCH (n:{kind}) RETURN n.id AS id, n.name AS name, n.file AS file, "
+            "n.lineno AS lineno, n.end_lineno AS end_lineno, n.docstring AS docstring"
+        ).get_as_df()
+        for _, row in df.iterrows():
+            file = str(row["file"] or "")
+            norm = file.replace("\\", "/").strip("/")
+            node_prefix = norm.split("/", 1)[0] if norm else "(root)"
+            if node_prefix != prefix:
+                continue
+            nodes.append({
+                "id": str(row["id"]), "kind": kind, "name": str(row["name"]),
+                "file": file, "lineno": row["lineno"], "end_lineno": row["end_lineno"],
+                "docstring": str(row["docstring"] or ""),
+            })
+    return nodes
+
+
+def get_cluster_edges(conn: kuzu.Connection, node_ids: list[str], rel: str,
+                       cross_file_only: bool = True) -> list[tuple[str, str]]:
+    """Edges of one kind between two nodes both in `node_ids` - what
+    clustering.cluster_module treats as "feature cohesion" evidence.
+    cross_file_only=True (the default, used for CALLS) restricts to pairs
+    living in different files, since same-file relationships don't tell
+    you anything about cross-file grouping - the file itself already
+    groups them. CALLS uses this restriction; INHERITS doesn't, since
+    same-file subclassing should still count toward cohesion."""
+    if not node_ids:
+        return []
+    where_extra = " AND a.file <> b.file" if cross_file_only else ""
+    df = conn.execute(
+        f"""
+        MATCH (a)-[:{rel}]->(b)
+        WHERE a.id IN $ids AND b.id IN $ids{where_extra}
+        RETURN a.id AS src, b.id AS dst
+        """,
+        {"ids": node_ids},
+    ).get_as_df()
+    return [(str(r["src"]), str(r["dst"])) for _, r in df.iterrows()]
+
+
+def get_edges_among(conn: kuzu.Connection, node_ids: list[str]) -> list[dict]:
+    """All CALLS/IMPORTS/INHERITS edges (any file, including same-file)
+    between nodes in `node_ids` - used for prompt context when writing a
+    chapter's documentation, where within-file relationships matter for
+    explaining what the code does even though they didn't drive
+    clustering."""
+    if not node_ids:
+        return []
+    edges: list[dict] = []
+    for rel in ("CALLS", "IMPORTS", "INHERITS"):
+        df = conn.execute(
+            f"""
+            MATCH (a)-[:{rel}]->(b)
+            WHERE a.id IN $ids AND b.id IN $ids
+            RETURN a.id AS src, a.name AS src_name, b.id AS dst, b.name AS dst_name
+            """,
+            {"ids": node_ids},
+        ).get_as_df()
+        for _, row in df.iterrows():
+            edges.append({
+                "src": str(row["src"]), "src_name": str(row["src_name"]),
+                "dst": str(row["dst"]), "dst_name": str(row["dst_name"]), "kind": rel,
+            })
+    return edges
+
+
 def get_concept_rules(conn: kuzu.Connection, code: str) -> list[dict]:
     """Every RULE attached to the Concept with this code - the deterministic
     answer to "what can <role> access/do"."""
