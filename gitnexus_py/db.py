@@ -16,6 +16,7 @@ Schema:
 
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 
@@ -52,6 +53,40 @@ CREATE REL TABLE RULE (
     effect STRING,
     condition STRING,
     lineno INT64
+)
+"""
+
+# Route: one row per URL pattern -> target, from route_extractor.py. `target`
+# is kept as the raw string the source encodes (may contain $1/$2
+# placeholders for CI4's wildcard-substitution routes) - substitution only
+# happens at question time, against a real URL the user actually asked
+# about (see db.resolve_url), never guessed at extraction time.
+_ROUTE_NODE_DDL = """
+CREATE NODE TABLE Route (
+    id STRING PRIMARY KEY,
+    pattern STRING,
+    http_method STRING,
+    target STRING,
+    kind STRING,
+    source_file STRING,
+    lineno INT64
+)
+"""
+
+# Render: one row per `view(...)` call found by view_extractor.py. Modeled
+# as its own node (like Route) rather than an edge, specifically so an
+# *unresolved* view reference (the string didn't match a known file) can
+# still be recorded and surfaced honestly instead of silently dropped -
+# there's no real graph node to point an edge at in that case.
+_RENDER_NODE_DDL = """
+CREATE NODE TABLE Render (
+    id STRING PRIMARY KEY,
+    source_file STRING,
+    source_kind STRING,
+    lineno INT64,
+    view_arg STRING,
+    target_file STRING,
+    resolved BOOLEAN
 )
 """
 
@@ -121,6 +156,10 @@ def _ensure_schema(conn: kuzu.Connection) -> None:
         conn.execute(_CONCEPT_NODE_DDL)
     if "RULE" not in existing:
         conn.execute(_RULE_REL_DDL)
+    if "Route" not in existing:
+        conn.execute(_ROUTE_NODE_DDL)
+    if "Render" not in existing:
+        conn.execute(_RENDER_NODE_DDL)
 
 
 def _ensure_embedding_column(conn: kuzu.Connection, kind: str) -> None:
@@ -378,5 +417,239 @@ def get_concept_rules(conn: kuzu.Connection, code: str) -> list[dict]:
         ORDER BY r.effect, target
         """,
         {"code": code},
+    ).get_as_df()
+    return df.to_dict(orient="records")
+
+
+def get_rules_for_file(conn: kuzu.Connection, file: str) -> list[dict]:
+    """Every RULE gating a Function/Module whose `.file` matches `file` -
+    the deterministic, page-scoped answer to "what rules gate this page",
+    instead of dumping every RULE in the whole repo (see
+    web.graph_facts_for_question)."""
+    df = conn.execute(
+        """
+        MATCH (c:Concept)-[r:RULE]->(t)
+        WHERE t.file = $file
+        RETURN c.code AS role, t.name AS target, r.effect AS effect, r.condition AS condition, r.lineno AS lineno
+        ORDER BY r.lineno
+        """,
+        {"file": file},
+    ).get_as_df()
+    return df.to_dict(orient="records")
+
+
+def list_module_files(conn: kuzu.Connection) -> list[str]:
+    """Every distinct Module `.file` path in the graph - used to spot which
+    file/page a natural-language question is naming (see
+    retrieval.find_mentioned_file)."""
+    df = conn.execute("MATCH (m:Module) RETURN DISTINCT m.file AS file").get_as_df()
+    return [str(v) for v in df["file"].tolist() if v]
+
+
+def get_inherits(conn: kuzu.Connection, class_name: str) -> list[dict]:
+    """Ancestor classes `class_name` extends, transitively - the
+    deterministic answer to "what does X inherit / extend"."""
+    df = conn.execute(
+        """
+        MATCH (c:Class {name: $name})-[:INHERITS*1..5]->(ancestor:Class)
+        RETURN DISTINCT ancestor.name AS ancestor, ancestor.file AS file
+        """,
+        {"name": class_name},
+    ).get_as_df()
+    return df.to_dict(orient="records")
+
+
+def get_subclasses(conn: kuzu.Connection, class_name: str) -> list[dict]:
+    """Classes that (transitively) extend `class_name` - the reverse of
+    get_inherits(), the deterministic answer to "what extends/subclasses
+    X"."""
+    df = conn.execute(
+        """
+        MATCH (child:Class)-[:INHERITS*1..5]->(ancestor:Class {name: $name})
+        RETURN DISTINCT child.name AS child, child.file AS file
+        """,
+        {"name": class_name},
+    ).get_as_df()
+    return df.to_dict(orient="records")
+
+
+def load_routes(conn: kuzu.Connection, routes: list[dict]) -> None:
+    """Bulk-insert Route nodes (see route_extractor.extract). Each dict:
+    {pattern, http_method, target, kind, source_file, lineno}. `target` is
+    kept as the raw string the source encodes - resolving it (including
+    substituting any $1/$2 wildcard placeholders) happens later, at
+    question time, in resolve_url()."""
+    for r in routes:
+        rid = f"route::{r['kind']}::{r['source_file']}::{r['lineno']}::{r['http_method']}::{r['pattern']}"
+        conn.execute(
+            """
+            MERGE (n:Route {id: $id})
+            SET n.pattern = $pattern, n.http_method = $http_method, n.target = $target,
+                n.kind = $kind, n.source_file = $source_file, n.lineno = $lineno
+            """,
+            {
+                "id": rid, "pattern": r["pattern"], "http_method": r["http_method"],
+                "target": r["target"], "kind": r["kind"], "source_file": r["source_file"],
+                "lineno": r["lineno"],
+            },
+        )
+
+
+def list_routes(conn: kuzu.Connection) -> list[dict]:
+    """Every extracted Route - the deterministic answer to "what
+    routes/pages exist" (mirrors `roles`'s list_concepts). Includes both
+    explicitly-declared routes and the convention-generated ones (see
+    route_extractor.py)."""
+    df = conn.execute(
+        "MATCH (r:Route) RETURN r.pattern AS pattern, r.http_method AS http_method, "
+        "r.target AS target, r.kind AS kind, r.source_file AS source_file, r.lineno AS lineno "
+        "ORDER BY r.pattern"
+    ).get_as_df()
+    return df.to_dict(orient="records")
+
+
+_ROUTE_PLACEHOLDER_RE = re.compile(r"\(:any\)|\(:num\)")
+
+
+def _route_pattern_to_regex(pattern: str) -> re.Pattern:
+    """Turn a CI4-style route pattern (literal segments + `(:any)`/`(:num)`
+    wildcards) into an anchored regex with one capture group per wildcard,
+    in source order - so matching a real URL against it both confirms the
+    route and captures the values `$1`, `$2`, ... in resolve_url() refer
+    to."""
+    parts = []
+    for chunk in re.split(r"(\(:any\)|\(:num\))", pattern):
+        if chunk == "(:any)":
+            parts.append("(.*)")
+        elif chunk == "(:num)":
+            parts.append(r"(\d+)")
+        else:
+            parts.append(re.escape(chunk))
+    return re.compile("^" + "".join(parts) + "$", re.IGNORECASE)
+
+
+def _normalize_url_path(url: str) -> str:
+    """Strip scheme/host/query/fragment and leading/trailing slashes from a
+    URL or bare path, so `https://app.example.com/icab/configuration?x=1`
+    and `/icab/configuration` and `icab/configuration` all normalize to the
+    same comparable string."""
+    url = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]+", "", url.strip())  # scheme://host
+    url = url.split("?", 1)[0].split("#", 1)[0]
+    return url.strip("/")
+
+
+def _target_class_to_file(target_class: str, known_files: dict[str, str]) -> str | None:
+    """Resolve a `Namespace\\Class` string (no `::method`) to a real
+    indexed Module file, via CI4's namespace<->path convention (`App\\` ->
+    `app/`, backslashes -> path separators, `.php` appended) - the same
+    convention rbac_extractor.py's _infer_app relies on elsewhere in this
+    codebase. `known_files` maps a forward-slash-normalized file path to
+    the original (possibly backslash-separated) path stored in the graph."""
+    path = target_class.lstrip("\\").replace("\\", "/")
+    if path.lower().startswith("app/"):
+        path = "app/" + path[len("app/"):]
+    return known_files.get(path + ".php")
+
+
+def resolve_url(conn: kuzu.Connection, url: str) -> dict:
+    """Resolve a real URL/path to a Controller file + method, by matching it
+    against every extracted Route (explicit and convention-generated
+    alike) and, for a match, substituting any `$1`/`$2` placeholders in the
+    target with the values captured from *this* URL's own wildcard
+    segments - never a guessed version number or argument.
+
+    Returns {resolved: True, file, class, method, matched_pattern} on a
+    clean match, or {resolved: False, matched_pattern, target} when a
+    route pattern matched but the (possibly-substituted) target class
+    isn't a file actually in the graph - e.g. an API version that isn't
+    indexed - or {resolved: False} when no route pattern matches at all.
+    """
+    normalized = _normalize_url_path(url)
+    routes = list_routes(conn)
+    known_files = {f.replace("\\", "/"): f for f in list_module_files(conn)}
+
+    for route in routes:
+        pattern = str(route["pattern"]).strip("/")
+        regex = _route_pattern_to_regex(pattern)
+        m = regex.match(normalized)
+        if not m:
+            continue
+        target = str(route["target"])
+        for i, group in enumerate(m.groups(), start=1):
+            target = target.replace(f"${i}", group)
+
+        class_ref, _, method = target.rpartition("::")
+        method = method or "index"
+        if not class_ref:
+            return {"resolved": False, "matched_pattern": route["pattern"], "target": target}
+
+        file = _target_class_to_file(class_ref, known_files)
+        if file is None:
+            return {"resolved": False, "matched_pattern": route["pattern"], "target": target}
+
+        return {
+            "resolved": True, "file": file, "class": class_ref.rsplit("\\", 1)[-1],
+            "method": method, "matched_pattern": route["pattern"],
+        }
+
+    return {"resolved": False}
+
+
+def get_role_page_matrix(conn: kuzu.Connection) -> list[dict]:
+    """Every RULE edge, grouped implicitly by (role, page) - the same data
+    get_rules_for_file/list_concepts already expose, aggregated across
+    every page at once instead of one page at a time. Deterministic answer
+    to "give me the role x page permission matrix"."""
+    df = conn.execute(
+        """
+        MATCH (c:Concept {kind: 'Role'})-[r:RULE]->(t)
+        RETURN c.code AS role, t.file AS file, r.effect AS effect
+        ORDER BY role, file
+        """
+    ).get_as_df()
+    return df.to_dict(orient="records")
+
+
+def load_renders(conn: kuzu.Connection, renders: list[dict]) -> None:
+    """Bulk-insert Render nodes (see view_extractor.extract). Each dict:
+    {source_file, source_kind, lineno, view_arg, target_file, resolved}.
+    Unresolved rows (target_file=None) are still inserted - see the Render
+    table's own docstring for why this is a node, not an edge."""
+    for r in renders:
+        rid = f"render::{r['source_file']}::{r['lineno']}::{r['view_arg']}"[:300]
+        conn.execute(
+            """
+            MERGE (n:Render {id: $id})
+            SET n.source_file = $source_file, n.source_kind = $source_kind, n.lineno = $lineno,
+                n.view_arg = $view_arg, n.target_file = $target_file, n.resolved = $resolved
+            """,
+            {
+                "id": rid, "source_file": r["source_file"], "source_kind": r["source_kind"],
+                "lineno": r["lineno"], "view_arg": r["view_arg"],
+                "target_file": r.get("target_file") or "", "resolved": bool(r.get("resolved")),
+            },
+        )
+
+
+def get_views_rendered(conn: kuzu.Connection, file: str) -> list[dict]:
+    """Every view-render call found in `file` - the deterministic (where
+    resolved) or honest-best-effort (where not) answer to "which view(s)
+    does this page render"."""
+    df = conn.execute(
+        "MATCH (r:Render {source_file: $file}) RETURN r.view_arg AS view_arg, "
+        "r.target_file AS target_file, r.resolved AS resolved, r.lineno AS lineno ORDER BY r.lineno",
+        {"file": file},
+    ).get_as_df()
+    return df.to_dict(orient="records")
+
+
+def get_pages_using_view(conn: kuzu.Connection, view_file: str) -> list[dict]:
+    """Reverse of get_views_rendered - every page that renders `view_file`
+    (only resolved rows, since an unresolved row by definition doesn't
+    name a real target_file)."""
+    df = conn.execute(
+        "MATCH (r:Render {target_file: $file, resolved: true}) "
+        "RETURN r.source_file AS source_file, r.lineno AS lineno ORDER BY r.source_file",
+        {"file": view_file},
     ).get_as_df()
     return df.to_dict(orient="records")

@@ -137,3 +137,91 @@ def find_mentioned_names(question: str, known_names: list[str], limit: int = 5) 
         if len(out) >= limit:
             break
     return out
+
+
+def find_mentioned_file(question: str, known_files: list[str]) -> str | None:
+    """Which known Module `.file` path (if any) the question is naming, so
+    "page"-scoped questions ("what rules gate this page", "where does the
+    data on X come from") can be resolved to a real file instead of only
+    ever answering globally. Same longest-match spirit as
+    find_mentioned_names, but matched against file basenames (a question
+    names a file, not a repo-relative path).
+
+    Tries, in order: exact basename mention (e.g. "IcabPermissionChecker.php"
+    or just "IcabPermissionChecker"), then a "page name" guess - the
+    basename with its extension stripped and CamelCase/underscores split
+    into words (e.g. "budget_controller.php" -> "budget controller"),
+    matched as a phrase in the question. Returns the single longest/most
+    specific match, or None if nothing in the question names a known file.
+    """
+    if not known_files:
+        return None
+    q_lower = question.lower()
+
+    def _basename(path: str) -> str:
+        return re.split(r"[\\/]", path)[-1]
+
+    def _stem(basename: str) -> str:
+        return re.sub(r"\.(php|py)$", "", basename, flags=re.IGNORECASE)
+
+    def _words(stem: str) -> str:
+        spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", stem)  # camelCase -> spaced
+        spaced = re.sub(r"[_\-]+", " ", spaced)
+        return spaced.strip().lower()
+
+    candidates: list[tuple[int, str]] = []  # (match length, file)
+    for f in known_files:
+        base = _basename(f)
+        stem = _stem(base)
+        if base.lower() in q_lower:
+            candidates.append((len(base), f))
+            continue
+        if len(stem) > 3 and stem.lower() in q_lower:
+            candidates.append((len(stem), f))
+            continue
+        words = _words(stem)
+        if words and len(words) > 3 and words in q_lower:
+            candidates.append((len(words), f))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    return candidates[0][1]
+
+
+_INTENT_KEYWORDS = {
+    "roles": re.compile(r"\brole|\bpermission|\baccess level|\bwho can\b", re.IGNORECASE),
+    "rules": re.compile(r"\brule|\bgate|\ballow|\bdeny|\bvalidat|\bcondition|\brestrict", re.IGNORECASE),
+    "data_source": re.compile(
+        r"\bdata\b.*\bcome|\bwhere.*data|\bdatabase|\btable\b|\bsql\b|\bmodel\b|\bsource\b|\bfetch|\bquery",
+        re.IGNORECASE,
+    ),
+    "inherits": re.compile(r"\bextend|\binherit|\bparent class|\bsubclass|\bbase class", re.IGNORECASE),
+    "impact": re.compile(r"\bcall|\bbreak|\bimpact|\bdepend|\baffect", re.IGNORECASE),
+    "matrix": re.compile(r"\bmatrix|\bwhich pages?\b|\bevery page\b|\ball pages\b", re.IGNORECASE),
+    "views": re.compile(r"\bview\b|\brender|\btemplate|\bpartial", re.IGNORECASE),
+}
+
+
+_URL_RE = re.compile(r"https?://\S+|(?<![\w.])/[\w][\w./-]*")
+
+
+def extract_url_or_path(question: str) -> str | None:
+    """Pull the first URL or path-shaped token (e.g. `/icab/configuration`
+    or `https://app/icab/configuration?x=1`) out of a question, so
+    graph_facts_for_question can try resolving it as a page URL
+    (db.resolve_url) before falling back to find_mentioned_file. A leading
+    `/` with no preceding word character avoids matching things like
+    "N/A" or a fraction as a path."""
+    m = _URL_RE.search(question)
+    return m.group(0) if m else None
+
+
+def classify_intents(question: str) -> set[str]:
+    """Which fact types a question is plausibly asking for - a cheap
+    keyword router (no extra LLM call, consistent with this project's
+    zero-extra-infra style) that lets graph_facts_for_question pull only
+    the graph facts relevant to the question instead of either everything
+    or nothing. Multiple intents can fire on one question (e.g. "what
+    rules and roles gate this page" is both "rules" and "roles")."""
+    return {intent for intent, pattern in _INTENT_KEYWORDS.items() if pattern.search(question)}

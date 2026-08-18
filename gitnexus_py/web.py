@@ -18,6 +18,7 @@ to stay close to the rest of the project's zero-server, no-CDN ethos -
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -31,12 +32,35 @@ from urllib.parse import urlparse, parse_qs
 
 import kuzu
 
+# One log file per working directory (next to .gitnexus_repos.json), plus
+# console output - so a failed /api/ask (a bad model name, an HTTP error
+# from Groq, GROQ_API_KEY missing, ...) leaves a real diagnostic trail
+# instead of just the generic "HTTP Error 404: Not Found" the browser
+# shows (see _call_groq - that generic text is exactly str(HTTPError),
+# which drops the response body Groq actually explains the failure in).
+logger = logging.getLogger("gitnexus_py")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _file_handler = logging.FileHandler(Path.cwd() / "gitnexus_py.log", encoding="utf-8")
+    _file_handler.setFormatter(_fmt)
+    logger.addHandler(_file_handler)
+    _console_handler = logging.StreamHandler()
+    _console_handler.setFormatter(_fmt)
+    logger.addHandler(_console_handler)
+
+from . import chat_store
 from .db import (
     export_graph_json, get_callers, get_impact, list_function_names,
     load_graph, open_db, ensure_vector_index, vector_search, NODE_KINDS, REL_KINDS,
+    list_concepts, get_concept_rules, get_rules_for_file, list_module_files, get_inherits,
+    get_subclasses, resolve_url, get_role_page_matrix, get_views_rendered,
 )
 from .parser import parse_repo
-from .retrieval import rank_context, find_mentioned_names, find_hop_count
+from .retrieval import (
+    rank_context, find_mentioned_names, find_hop_count, find_mentioned_file, classify_intents,
+    extract_url_or_path,
+)
 
 _NODE_COLORS = {
     "Module": "#4c6ef5",
@@ -128,13 +152,26 @@ _PAGE = """<!doctype html>
   .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
 
   #askResult { display: flex; flex-direction: column; gap: 14px; margin-top: 14px;
-    max-height: calc(100vh - 340px); min-height: 80px; overflow-y: auto; padding-right: 4px; }
+    min-height: 80px; overflow-y: auto; padding-right: 4px; }
   #askResult:empty { display: none; }
   .chat-turn { display: flex; flex-direction: column; gap: 6px; max-width: 80%; }
   .chat-turn.turn-q { align-self: flex-end; align-items: flex-end; }
   .chat-turn.turn-a { align-self: flex-start; align-items: flex-start; }
-  .chat-q { background: var(--accent); color: #fff; border-radius: 12px 12px 2px 12px;
+  .chat-q { position: relative; background: var(--accent); color: #fff; border-radius: 12px 12px 2px 12px;
     padding: 9px 14px; white-space: pre-wrap; line-height: 1.5; }
+  .chat-q-img { max-width: 220px; max-height: 160px; border-radius: 8px; display: block; margin-bottom: 6px; }
+  .msg-del { position: absolute; top: -8px; left: -8px; width: 18px; height: 18px; border-radius: 50%;
+    background: var(--panel); border: 1px solid var(--border); color: var(--muted); font-size: 12px;
+    line-height: 16px; text-align: center; cursor: pointer; visibility: hidden; }
+  .chat-turn.turn-q:hover .msg-del { visibility: visible; }
+  .msg-del:hover { color: var(--danger); border-color: var(--danger); }
+  #askImagePreview { display: flex; align-items: center; gap: 10px; background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+  #askImagePreview img { max-height: 60px; border-radius: 6px; }
+  #askImagePreview .remove { cursor: pointer; color: var(--muted); font-size: 13px; margin-left: auto; }
+  #askImagePreview .remove:hover { color: var(--text); }
+  #askAttachBtn { font-size: 16px; padding: 8px 10px; }
+  #askAttachBtn.attached { border-color: var(--accent); }
   .chat-a { background: var(--panel-2); border: 1px solid var(--border);
     border-radius: 12px 12px 12px 2px; padding: 9px 14px; white-space: pre-wrap; line-height: 1.6; }
   .chat-a.clarify { border-color: var(--accent); }
@@ -162,6 +199,31 @@ _PAGE = """<!doctype html>
   .chat-detail-body { margin-top: 4px; padding: 8px 12px; background: var(--code-bg);
     border: 1px solid var(--border); border-radius: 8px; font-size: 12.5px; line-height: 1.6;
     color: var(--muted); white-space: pre-wrap; }
+
+  /* ---- ChatGPT-style sidebar for the Ask tab ---- */
+  .ask-layout { display: flex; gap: 16px; align-items: flex-start; height: calc(100vh - 100px); }
+  .chat-sidebar { width: 260px; flex-shrink: 0; height: 100%; display: flex; flex-direction: column;
+    gap: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px; }
+  .chat-sidebar-new { display: flex; align-items: center; justify-content: center; gap: 6px;
+    background: none; border: 1px solid var(--border); color: var(--text); border-radius: 8px;
+    padding: 10px 12px; font-size: 13px; font-weight: 500; cursor: pointer; flex-shrink: 0; }
+  .chat-sidebar-new span { font-size: 15px; line-height: 1; }
+  .chat-sidebar-new:hover { background: var(--panel-2); border-color: var(--accent); }
+  .chat-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+  .chat-list-empty { color: var(--muted); font-size: 12.5px; padding: 10px 8px; }
+  .chat-list-item { display: flex; align-items: center; gap: 6px; padding: 8px 10px;
+    border-radius: 8px; cursor: pointer; font-size: 13px; color: var(--text); }
+  .chat-list-item:hover { background: var(--panel-2); }
+  .chat-list-item.active { background: var(--panel-2); box-shadow: inset 0 0 0 1px var(--accent); }
+  .chat-list-item .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chat-list-item .del { flex-shrink: 0; color: var(--muted); font-size: 13px; line-height: 1;
+    padding: 2px 4px; border-radius: 4px; visibility: hidden; }
+  .chat-list-item:hover .del { visibility: visible; }
+  .chat-list-item .del:hover { color: var(--danger); background: var(--panel); }
+  .ask-main { flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column;
+    overflow: hidden; margin-bottom: 0; }
+  .ask-main #askResult { flex: 1; }
 
   #graphWrap { position: relative; height: calc(100vh - 130px); border: 1px solid var(--border);
     border-radius: 10px; overflow: hidden; background: var(--panel); }
@@ -315,23 +377,34 @@ _PAGE = """<!doctype html>
       </div>
     </section>
 
-    <section id="view-ask" class="view">
-      <div class="card">
-        <h2>Ask the graph</h2>
-        <p class="hint">Natural-language impact analysis: mention a function name and it pulls its
-          <b>real</b> callers + transitive blast radius straight from the CALLS graph (not a guess),
-          plus hybrid TF-IDF + semantic search over docstrings for everything else, then sends it
-          all to Groq's LLM for a concrete, cited answer. If the context isn't enough to answer
-          confidently, it'll ask a clarifying question instead (marked
-          <span class="chat-label" style="color:var(--accent)">clarifying</span>) - just reply in the
-          box below to continue.
-          Requires <code class="inline">GROQ_API_KEY</code> to be set on the machine running
-          <code class="inline">serve</code>.</p>
-        <div id="askResult"><div class="chat-empty">Ask a question about the codebase to get started.</div></div>
-        <div class="row" style="margin-top:10px; align-items:flex-end">
-          <textarea id="askInput" placeholder="What breaks if I change get_app_url? (Enter to send, Shift+Enter for a new line)" style="min-height:44px"></textarea>
-          <button class="primary" id="askBtn">Send</button>
-          <button class="chat-clear" id="askClearBtn">Clear history</button>
+    <section id="view-ask" class="view wide">
+      <div class="ask-layout">
+        <aside class="chat-sidebar">
+          <button class="chat-sidebar-new" id="newChatBtn"><span>+</span> New chat</button>
+          <div class="chat-list" id="chatList"></div>
+        </aside>
+        <div class="card ask-main">
+          <h2>Ask the graph</h2>
+          <p class="hint">Natural-language impact analysis: mention a function name and it pulls its
+            <b>real</b> callers + transitive blast radius straight from the CALLS graph (not a guess),
+            plus hybrid TF-IDF + semantic search over docstrings for everything else, then sends it
+            all to Groq's LLM for a concrete, cited answer. If the context isn't enough to answer
+            confidently, it'll ask a clarifying question instead (marked
+            <span class="chat-label" style="color:var(--accent)">clarifying</span>) - just reply in the
+            box below to continue.
+            You can also attach a screenshot (paperclip button, or paste with Ctrl+V) - Gemini reads
+            the identifying text in it (page titles, labels, URLs) and feeds that into the same
+            pipeline as a typed question.
+            Requires <code class="inline">GROQ_API_KEY</code> (and <code class="inline">GEMINI_API_KEY</code>
+            for image questions) to be set on the machine running <code class="inline">serve</code>.</p>
+          <div id="askResult"><div class="chat-empty">Ask a question about the codebase to get started.</div></div>
+          <div id="askImagePreview" style="display:none; margin-top:10px;"></div>
+          <div class="row" style="margin-top:10px; align-items:flex-end">
+            <button class="secondary" id="askAttachBtn" title="Attach a screenshot" style="flex-shrink:0">📎</button>
+            <input type="file" id="askImageInput" accept="image/*" style="display:none">
+            <textarea id="askInput" placeholder="What breaks if I change get_app_url? (Enter to send, Shift+Enter for a new line, Ctrl+V to paste a screenshot)" style="min-height:44px"></textarea>
+            <button class="primary" id="askBtn">Send</button>
+          </div>
         </div>
       </div>
     </section>
@@ -353,6 +426,7 @@ _PAGE = """<!doctype html>
 const NODE_COLORS = __NODE_COLORS_JSON__;
 const EDGE_COLORS = __EDGE_COLORS_JSON__;
 const KIND_LEGEND_HTML = __LEGEND_JSON__;
+const INITIAL_DB_PATH = __DB_PATH_JSON__;
 
 // ---------------------------------------------------------------- nav ----
 const views = document.querySelectorAll('.view');
@@ -500,7 +574,127 @@ document.getElementById('exploreBtn').addEventListener('click', runExplore);
 document.getElementById('exploreInput').addEventListener('keydown', e => { if (e.key === 'Enter') runExplore(); });
 
 // ---------------------------------------------------------------- ask ----
-let askHistory = []; // [{question, answer}, ...] - sent back for conversational context
+let askHistory = []; // [{question, answer, imageDataUrl?, contextQuestion?, seq?}, ...] - sent back for conversational context
+let pendingImage = null; // {base64, mime, dataUrl} - attached but not yet sent
+let currentChatId = null; // null = not-yet-persisted "new chat" - created lazily on first send
+
+function activeRepoPath() {
+  const sel = document.getElementById('repoSelect');
+  return (sel && sel.value) || INITIAL_DB_PATH;
+}
+
+let chatListCache = []; // last-loaded [{id, title, ...}] - re-rendered whenever currentChatId changes
+
+async function loadChatList() {
+  try {
+    const r = await api('/api/chats?repo=' + encodeURIComponent(activeRepoPath()));
+    chatListCache = r.chats;
+  } catch (e) { chatListCache = []; /* chat store not reachable yet - list just stays empty */ }
+  renderChatList();
+}
+
+function renderChatList() {
+  const el = document.getElementById('chatList');
+  if (!chatListCache.length) {
+    el.innerHTML = '<div class="chat-list-empty">No past chats yet.</div>';
+    return;
+  }
+  el.innerHTML = chatListCache.map(c => `
+    <div class="chat-list-item${c.id === currentChatId ? ' active' : ''}" data-id="${escapeHtml(c.id)}">
+      <span class="title">${escapeHtml(c.title || '(untitled)')}</span>
+      <span class="del" title="Delete chat" data-id="${escapeHtml(c.id)}">&times;</span>
+    </div>`).join('');
+  el.querySelectorAll('.chat-list-item').forEach(item => {
+    item.addEventListener('click', () => loadChat(item.dataset.id));
+  });
+  el.querySelectorAll('.del').forEach(btn => {
+    btn.addEventListener('click', (ev) => { ev.stopPropagation(); deleteChat(btn.dataset.id); });
+  });
+}
+
+function startNewChat() {
+  currentChatId = null;
+  askHistory = [];
+  clearPendingImage();
+  renderAskHistory();
+  renderChatList();
+  document.getElementById('askInput').placeholder =
+    'What breaks if I change get_app_url? (Enter to send, Shift+Enter for a new line, Ctrl+V to paste a screenshot)';
+}
+
+async function loadChat(chatId) {
+  if (!chatId || chatId === currentChatId) return;
+  try {
+    const r = await api('/api/chat-messages?chat_id=' + encodeURIComponent(chatId));
+    currentChatId = chatId;
+    askHistory = r.messages.map(m => ({
+      question: m.question, answer: m.answer, type: m.type, detail: m.detail,
+      imageDataUrl: m.image_data_url || null,
+      contextQuestion: m.context_question || m.question,
+      seq: m.seq,
+    }));
+    clearPendingImage();
+    renderAskHistory();
+    renderChatList();
+  } catch (e) { alert('Could not load chat: ' + e.message); }
+}
+
+async function deleteChat(chatId) {
+  if (!confirm('Delete this chat?')) return;
+  try {
+    await api('/api/chats/delete', { method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ chat_id: chatId }) });
+    if (chatId === currentChatId) startNewChat();
+    loadChatList();
+  } catch (e) { alert('Could not delete chat: ' + e.message); }
+}
+
+document.getElementById('newChatBtn').addEventListener('click', startNewChat);
+loadChatList();
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result;
+      resolve({ dataUrl, base64: dataUrl.split(',')[1], mime: file.type || 'image/png' });
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function setPendingImage(file) {
+  if (!file || !file.type.startsWith('image/')) return;
+  pendingImage = await fileToBase64(file);
+  const preview = document.getElementById('askImagePreview');
+  preview.style.display = 'flex';
+  preview.innerHTML = `<img src="${pendingImage.dataUrl}"><span class="muted">Image attached</span>
+    <span class="remove" id="askImageRemove">&times; remove</span>`;
+  document.getElementById('askImageRemove').addEventListener('click', clearPendingImage);
+  document.getElementById('askAttachBtn').classList.add('attached');
+}
+
+function clearPendingImage() {
+  pendingImage = null;
+  const preview = document.getElementById('askImagePreview');
+  preview.style.display = 'none';
+  preview.innerHTML = '';
+  document.getElementById('askAttachBtn').classList.remove('attached');
+}
+
+document.getElementById('askAttachBtn').addEventListener('click', () => {
+  document.getElementById('askImageInput').click();
+});
+document.getElementById('askImageInput').addEventListener('change', (ev) => {
+  const file = ev.target.files && ev.target.files[0];
+  ev.target.value = ''; // allow attaching the same file again later
+  if (file) setPendingImage(file);
+});
+document.getElementById('askInput').addEventListener('paste', (ev) => {
+  const item = Array.from(ev.clipboardData?.items || []).find(i => i.type.startsWith('image/'));
+  if (item) { ev.preventDefault(); setPendingImage(item.getAsFile()); }
+});
 
 function renderAskHistory() {
   const out = document.getElementById('askResult');
@@ -508,15 +702,34 @@ function renderAskHistory() {
     out.innerHTML = '<div class="chat-empty">Ask a question about the codebase to get started.</div>';
     return;
   }
-  out.innerHTML = askHistory.map(turn => `
-    <div class="chat-turn turn-q"><div class="chat-q">${escapeHtml(turn.question)}</div></div>
+  out.innerHTML = askHistory.map((turn, i) => `
+    <div class="chat-turn turn-q" data-idx="${i}"><div class="chat-q">
+      ${turn.imageDataUrl ? `<img class="chat-q-img" src="${turn.imageDataUrl}">` : ''}
+      ${escapeHtml(turn.question)}
+      ${turn.seq !== undefined ? `<span class="msg-del" title="Delete this message" data-idx="${i}">&times;</span>` : ''}
+      </div></div>
     <div class="chat-turn turn-a">
       ${turn.type === 'clarify' ? '<div class="chat-label clarify-label">clarifying</div>' : ''}
       <div class="chat-a${turn.type === 'clarify' ? ' clarify' : ''}">${escapeHtml(turn.answer)}</div>
       ${turn.detail ? `<details class="chat-detail"><summary></summary>
         <div class="chat-detail-body">${escapeHtml(turn.detail)}</div></details>` : ''}
     </div>`).join('');
+  out.querySelectorAll('.msg-del').forEach(btn => {
+    btn.addEventListener('click', (ev) => { ev.stopPropagation(); deleteMessage(parseInt(btn.dataset.idx, 10)); });
+  });
   out.scrollTop = out.scrollHeight;
+}
+
+async function deleteMessage(idx) {
+  const turn = askHistory[idx];
+  if (!turn || turn.seq === undefined) return; // not yet persisted - nothing to delete server-side
+  if (!confirm('Delete this message?')) return;
+  try {
+    await api('/api/chat-messages/delete', { method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ chat_id: currentChatId, seq: turn.seq }) });
+    askHistory.splice(idx, 1);
+    renderAskHistory();
+  } catch (e) { alert('Could not delete message: ' + e.message); }
 }
 
 async function sendAsk() {
@@ -524,9 +737,11 @@ async function sendAsk() {
   const q = input.value.trim();
   const btn = document.getElementById('askBtn');
   const out = document.getElementById('askResult');
-  if (!q) return;
+  const image = pendingImage; // snapshot - cleared from the input right away, kept for this request
+  if (!q && !image) return;
   btn.disabled = true;
   input.value = '';
+  clearPendingImage();
   renderAskHistory();
   out.insertAdjacentHTML('beforeend',
     '<div class="chat-typing"><span></span><span></span><span></span></div>');
@@ -534,30 +749,53 @@ async function sendAsk() {
   try {
     // history is sent back so a "clarify" turn's follow-up reply is
     // answered with the earlier question still in context - see
-    // _call_groq's history handling in web.py.
+    // _call_groq's history handling in web.py. Each turn's *contextQuestion*
+    // (not the raw, often placeholder `question`) is what's replayed here -
+    // for an image turn that's the Gemini-extracted description, so an
+    // earlier screenshot's content stays in context for follow-ups instead
+    // of vanishing after that one turn.
+    const historyForApi = askHistory.map(t => ({question: t.contextQuestion || t.question, answer: t.answer}));
+    const payload = {question: q, history: historyForApi};
+    if (image) { payload.image = image.base64; payload.image_mime = image.mime; }
     const r = await api('/api/ask', { method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({question: q, history: askHistory}) });
-    askHistory.push({question: q, answer: r.content, type: r.type, detail: r.detail || ''});
+      body: JSON.stringify(payload) });
+    const turn = {question: q || '(image)', answer: r.content, type: r.type, detail: r.detail || '',
+      imageDataUrl: image ? image.dataUrl : null,
+      contextQuestion: r.resolved_question || q || '(image)'};
+    askHistory.push(turn);
     input.placeholder = r.type === 'clarify'
       ? 'Answer the question above, or ask something else...'
-      : 'What breaks if I change get_app_url? (Enter to send, Shift+Enter for a new line)';
+      : 'What breaks if I change get_app_url? (Enter to send, Shift+Enter for a new line, Ctrl+V to paste a screenshot)';
     renderAskHistory();
+    await persistTurn(turn); // creates a chat on the first turn of a "New chat"
   } catch (e) {
     renderAskHistory();
     out.insertAdjacentHTML('beforeend', `<div class="error">${escapeHtml(e.message)}</div>`);
   } finally { btn.disabled = false; input.focus(); }
 }
 
+async function persistTurn(turn) {
+  try {
+    if (!currentChatId) {
+      const chat = await api('/api/chats', { method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ repo_db_path: activeRepoPath() }) });
+      currentChatId = chat.id;
+    }
+    const saved = await api('/api/chat-messages', { method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        chat_id: currentChatId, question: turn.question, answer: turn.answer,
+        type: turn.type || '', detail: turn.detail || '', image_data_url: turn.imageDataUrl || null,
+        context_question: turn.contextQuestion || turn.question,
+      }) });
+    turn.seq = saved.seq; // lets deleteMessage target this turn once it's on disk
+    renderAskHistory();
+    loadChatList();
+  } catch (e) { /* history still shown live even if persisting to disk failed */ }
+}
+
 document.getElementById('askBtn').addEventListener('click', sendAsk);
 document.getElementById('askInput').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAsk(); }
-});
-
-document.getElementById('askClearBtn').addEventListener('click', () => {
-  askHistory = [];
-  renderAskHistory();
-  document.getElementById('askInput').placeholder =
-    'What breaks if I change get_app_url? (Enter to send, Shift+Enter for a new line)';
 });
 
 // ------------------------------------------------------------- cypher ----
@@ -851,6 +1089,7 @@ def _render_page(db_path: str) -> str:
     )
     html = _PAGE
     html = html.replace("__DB_PATH__", db_path)
+    html = html.replace("__DB_PATH_JSON__", json.dumps(db_path))
     html = html.replace("__LEGEND__", legend_items)
     html = html.replace("__NODE_COLORS_JSON__", json.dumps(_NODE_COLORS))
     html = html.replace("__EDGE_COLORS_JSON__", json.dumps(_EDGE_COLORS))
@@ -932,10 +1171,29 @@ class ServerState:
         self.db, self.conn = open_db(db_path, fresh=False)
 
     def switch(self, db_path: str) -> None:
+        logger.info("ServerState.switch: closing %s, opening %s", self.db_path, db_path)
         self.conn.close()
         self.db.close()
-        self.db_path = db_path
-        self.db, self.conn = open_db(db_path, fresh=False)
+
+        # Windows can lag releasing the just-closed db's OS-level file lock
+        # by a beat, and if `db_path` happens to be the same file (or
+        # anything else transiently touches it - AV scan, etc.) the very
+        # next open can fail with "Could not set lock on file" even though
+        # nothing is genuinely still holding it. Short retry instead of
+        # failing the whole switch on a one-off timing race.
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                self.db, self.conn = open_db(db_path, fresh=False)
+                self.db_path = db_path
+                logger.info("ServerState.switch: opened %s (attempt %d)", db_path, attempt + 1)
+                return
+            except RuntimeError as exc:
+                last_exc = exc
+                logger.warning("ServerState.switch: attempt %d failed for %s: %s", attempt + 1, db_path, exc)
+                time.sleep(0.5)
+        logger.error("ServerState.switch: giving up on %s after retries", db_path)
+        raise last_exc
 
 
 _SKIP_DIRS = {".git", "__pycache__", "node_modules", "venv", ".venv", "env", ".env",
@@ -1042,9 +1300,18 @@ def make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                     self._send_json({"rows": get_impact(state.conn, name, max_hops=hops), "resolved_name": resolved})
                 elif parsed.path == "/api/repos":
                     self._send_json({"repos": _load_registry(), "active": str(Path(state.db_path).resolve())})
+                elif parsed.path == "/api/chats":
+                    repo = (qs.get("repo") or [state.db_path])[0]
+                    self._send_json({"chats": chat_store.list_chats(repo)})
+                elif parsed.path == "/api/chat-messages":
+                    chat_id = (qs.get("chat_id") or [""])[0]
+                    if not chat_id:
+                        raise RuntimeError("chat_id required")
+                    self._send_json({"messages": chat_store.get_messages(chat_id)})
                 else:
                     self._send_json({"error": "not found"}, status=404)
             except Exception as exc:  # noqa: BLE001 - surface any DB/query error to the UI
+                logger.error("GET %s failed: %s", parsed.path, exc, exc_info=True)
                 self._send_json({"error": str(exc)}, status=400)
 
         def do_POST(self):  # noqa: N802
@@ -1056,28 +1323,84 @@ def make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                     columns, rows = _query_rows(state.conn, query)
                     self._send_json({"columns": columns, "rows": rows})
                 elif parsed.path == "/api/ask":
-                    self._send_json(_ask(state.conn, body.get("question", ""), body.get("model"), body.get("history")))
+                    question = body.get("question", "")
+                    image_b64 = body.get("image")
+                    if image_b64:
+                        logger.info("POST /api/ask (with image): %r image_mime=%s",
+                                     question[:200], body.get("image_mime"))
+                        self._send_json(_ask_with_image(
+                            state.conn, question, image_b64, body.get("image_mime", "image/png"),
+                            body.get("model"), body.get("history"), db_path=state.db_path))
+                    else:
+                        logger.info("POST /api/ask: %r", question[:200])
+                        self._send_json(_ask(state.conn, question, body.get("model"),
+                                              body.get("history"), db_path=state.db_path))
                 elif parsed.path == "/api/summarize":
                     self._send_json({"summary": _summarize(state.conn, body.get("model"))})
                 elif parsed.path == "/api/switch-repo":
                     db_path = body.get("db_path", "")
                     if not db_path:
                         raise RuntimeError("db_path required")
+                    logger.info("Switching repo: %s -> %s", state.db_path, db_path)
                     state.switch(db_path)
                     self._send_json({"ok": True, "active": state.db_path})
                 elif parsed.path == "/api/index-repo":
                     result = index_uploaded_repo(body.get("repo_name", "repo"), body.get("files", []))
                     state.switch(result["db_path"])
                     self._send_json(result)
+                elif parsed.path == "/api/chats":
+                    repo = body.get("repo_db_path") or state.db_path
+                    self._send_json(chat_store.create_chat(repo, body.get("title", "")))
+                elif parsed.path == "/api/chat-messages":
+                    chat_id = body.get("chat_id", "")
+                    if not chat_id:
+                        raise RuntimeError("chat_id required")
+                    question, answer = body.get("question", ""), body.get("answer", "")
+                    chat = chat_store.get_chat(chat_id)
+                    # Only the chat's first turn needs a generated title -
+                    # every later turn already has one and just keeps it
+                    # (see add_message), so skip the extra LLM round-trip.
+                    title = (_generate_chat_title(question, answer, body.get("model"))
+                             if chat and not chat["title"] else None)
+                    self._send_json(chat_store.add_message(
+                        chat_id, question, answer, body.get("type", ""), body.get("detail", ""),
+                        body.get("image_data_url"), title=title,
+                        context_question=body.get("context_question", "")))
+                elif parsed.path == "/api/chats/delete":
+                    chat_id = body.get("chat_id", "")
+                    if not chat_id:
+                        raise RuntimeError("chat_id required")
+                    chat_store.delete_chat(chat_id)
+                    self._send_json({"ok": True})
+                elif parsed.path == "/api/chat-messages/delete":
+                    chat_id = body.get("chat_id", "")
+                    seq = body.get("seq")
+                    if not chat_id or seq is None:
+                        raise RuntimeError("chat_id and seq required")
+                    chat_store.delete_message(chat_id, int(seq))
+                    self._send_json({"ok": True})
                 else:
                     self._send_json({"error": "not found"}, status=404)
             except Exception as exc:  # noqa: BLE001
+                logger.error("POST %s failed: %s", parsed.path, exc, exc_info=True)
                 self._send_json({"error": str(exc)}, status=400)
 
     return Handler
 
 
-def graph_facts_for_question(conn: kuzu.Connection, question: str) -> str:
+_DB_ISH_PATTERNS = [
+    re.compile(r"\$this\s*->\s*db\b"),
+    re.compile(r"->\s*table\s*\("),
+    re.compile(r"->\s*query\s*\("),
+    re.compile(r"\bModel\s*::"),
+    re.compile(r"\bextends\s+\w*Model\b"),
+    re.compile(r"App\\Models\\\w+"),
+    re.compile(r"\bfind\s*\(|->\s*where\s*\(|->\s*get\s*\("),
+    re.compile(r"\$_(GET|POST|REQUEST|SESSION)\b"),
+]
+
+
+def _impact_facts(conn: kuzu.Connection, question: str) -> str:
     """Impact-analysis questions ("what breaks if I change X?", "who calls
     Y?") need real CALLS-graph traversal, not docstring similarity - TF-IDF
     over docstrings has no idea who calls whom. This spots function names
@@ -1110,6 +1433,345 @@ def graph_facts_for_question(conn: kuzu.Connection, question: str) -> str:
     return "\n\n".join(sections)
 
 
+def _roles_facts(conn: kuzu.Connection) -> str:
+    """Deterministic answer to "what roles/permissions are there" - every
+    Role Concept extracted by rbac_extractor.py. Same data the `roles` CLI
+    command reports, just reformatted as an LLM context block."""
+    rows = list_concepts(conn, kind="Role")
+    if not rows:
+        return ""
+    lines = ["Graph facts - Roles defined in this codebase:"]
+    for r in rows:
+        lines.append(f"  {r['code']} ({r['name']}) - app: {r['app']}, defined at {r['source_file']}:{r['lineno']}")
+    return "\n".join(lines)
+
+
+def _rules_facts(conn: kuzu.Connection, resolved_file: str | None) -> str:
+    """Deterministic answer to "what rules gate this page/function" - RULE
+    edges (role -> effect/condition) attached to nodes in `resolved_file`.
+    Scoped by file so this doesn't dump every rule in the repo when the
+    question is asking about one specific page."""
+    if not resolved_file:
+        return ("Note: the question seems to be about access rules, but no specific file/page was "
+                "recognized in it - name the page/file to get rules scoped to it.")
+    rows = get_rules_for_file(conn, resolved_file)
+    if not rows:
+        return f"Graph facts - no RULE edges found gating anything in {resolved_file}."
+    lines = [f"Graph facts - Rules gating {resolved_file}:"]
+    for r in rows:
+        lines.append(f"  role {r['role']} -> {r['effect']} `{r['target']}` (line {r['lineno']}): {r['condition']}")
+    return "\n".join(lines)
+
+
+def _inherits_facts(conn: kuzu.Connection, question: str) -> str:
+    """Deterministic answer to "what does X extend/inherit" *and* "what
+    extends/subclasses X" - walks the INHERITS edge (already resolved
+    cross-file at index time) both directions instead of guessing from
+    docstrings. Both directions are always included rather than trying to
+    parse which way the English question points ("what does X extend" vs
+    "what extends X") - the LLM reads both facts and quotes whichever
+    actually answers the question; this can't misfire the way a direction
+    heuristic could."""
+    _, class_rows = _query_rows(conn, "MATCH (c:Class) RETURN DISTINCT c.name AS name")
+    class_names = [str(r["name"]) for r in class_rows]
+    names = find_mentioned_names(question, class_names, limit=3)
+    sections = []
+    for name in names:
+        ancestors = get_inherits(conn, name)
+        if ancestors:
+            sections.append(f"Graph facts - `{name}` inherits from: " +
+                             ", ".join(f"{a['ancestor']} ({a['file']})" for a in ancestors))
+        else:
+            sections.append(f"Graph facts - `{name}` has no INHERITS edges found (doesn't extend anything indexed).")
+
+        children = get_subclasses(conn, name)
+        if children:
+            sections.append(f"Graph facts - Classes that extend `{name}`: " +
+                             ", ".join(f"{c['child']} ({c['file']})" for c in children))
+        else:
+            sections.append(f"Graph facts - No classes found that extend `{name}`.")
+    return "\n\n".join(sections)
+
+
+def _matrix_facts(conn: kuzu.Connection) -> str:
+    """Deterministic answer to "give me the role x page permission matrix"
+    - the same RULE data get_rules_for_file exposes per-page, aggregated
+    across every page at once."""
+    rows = get_role_page_matrix(conn)
+    if not rows:
+        return "Graph facts - no RULE edges found in this codebase (nothing to build a matrix from)."
+    by_role: dict[str, list[str]] = {}
+    for r in rows:
+        by_role.setdefault(str(r["role"]), []).append(f"{r['file']} ({r['effect']})")
+    lines = ["Graph facts - Role x page permission matrix (file: effect):"]
+    for role, pages in sorted(by_role.items()):
+        lines.append(f"  {role}: " + "; ".join(pages))
+    return "\n".join(lines)
+
+
+def _views_facts(conn: kuzu.Connection, resolved_file: str | None) -> str:
+    """Deterministic (where resolved) or honest best-effort (where not)
+    answer to "which view(s) does this page render" - RENDERS facts from
+    view_extractor.py, scoped to `resolved_file`."""
+    if not resolved_file:
+        return ("Note: the question seems to be about view rendering, but no specific file/page "
+                "was recognized in it - name the page/file to get facts scoped to it.")
+    rows = get_views_rendered(conn, resolved_file)
+    if not rows:
+        return f"Graph facts - no view(...) calls found in {resolved_file}."
+    lines = [f"Graph facts - Views rendered by {resolved_file}:"]
+    for r in rows:
+        if r["resolved"]:
+            lines.append(f"  line {r['lineno']}: `{r['view_arg']}` -> {r['target_file']}")
+        else:
+            lines.append(f"  line {r['lineno']}: `{r['view_arg']}` (referenced but not found in the indexed graph)")
+    return "\n".join(lines)
+
+
+def _resolve_repo_root(db_path: str) -> Path | None:
+    """Best-effort: find the source tree a db was indexed from, so
+    _data_source_facts can read a page's raw source for DB-ish evidence.
+    Only reliable for dashboard-uploaded repos (a fixed .gitnexus_uploads/
+    <slug>.db <-> .gitnexus_uploads/<slug>/ convention - see
+    index_uploaded_repo); CLI-indexed repos don't record their source root
+    anywhere, so this returns None for those rather than guessing, and the
+    caller degrades gracefully (skips the raw-source scan)."""
+    p = Path(db_path)
+    if p.parent.name == ".gitnexus_uploads" and p.suffix == ".db":
+        candidate = p.parent / p.stem
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _data_source_facts(conn: kuzu.Connection, db_path: str, resolved_file: str | None) -> str:
+    """Best-effort answer to "where does this page's data come from".
+    There's no real data-lineage extractor (see README limitations - calls
+    through an object property like $this->someModel->method() aren't
+    resolved), so this surfaces what *is* known: the page's own IMPORTS
+    (which Models/Helpers/Libraries it pulls in) plus a lightweight,
+    non-persisted regex scan of the file's raw source for DB-ish lines
+    (query builder calls, $this->db, $_GET/$_POST, ...), each with a line
+    number so it reads as evidence, not a claimed-complete trace."""
+    if not resolved_file:
+        return ("Note: the question seems to be about where data comes from, but no specific "
+                "file/page was recognized in it - name the page/file to get evidence scoped to it.")
+
+    lines = [f"Evidence for data sources in {resolved_file} (best-effort, not a guaranteed-complete trace):"]
+
+    _, imp_rows = _query_rows(
+        conn,
+        "MATCH (m:Module {file: $file})-[:IMPORTS]->(t) RETURN t.name AS name",
+        {"file": resolved_file},
+    )
+    if imp_rows:
+        lines.append("  Imports: " + ", ".join(str(r["name"]) for r in imp_rows))
+
+    root = _resolve_repo_root(db_path)
+    if root is not None:
+        src = root / resolved_file
+        if src.is_file():
+            try:
+                text = src.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                text = ""
+            hits = []
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if any(pat.search(line) for pat in _DB_ISH_PATTERNS):
+                    hits.append(f"    line {lineno}: {line.strip()[:120]}")
+                if len(hits) >= 20:
+                    break
+            if hits:
+                lines.append("  DB-ish lines found in the file (not a resolved trace - just pattern matches):")
+                lines.extend(hits)
+    if len(lines) == 1:
+        lines.append("  Nothing found - no imports and no DB-ish patterns detected in this file.")
+    return "\n".join(lines)
+
+
+_MAX_SOURCE_CHARS = 6000  # keep a single method's body from blowing up the LLM context
+
+
+def _extract_method_source(text: str, method_name: str, class_name: str | None = None) -> str | None:
+    """Pull one method/function's body (signature through matching closing
+    brace) out of raw PHP source by brace-counting from the `function
+    name(` occurrence - not a real parse (doesn't know about braces inside
+    strings/comments), but good enough for well-formed source, same
+    best-effort spirit as the DB-ish regex scan above. Function nodes for
+    PHP don't carry real line numbers in this graph (only the Python side
+    does - see parser.py vs php_parser.py), so re-scanning the source
+    directly, on demand, is the only way to get an exact method body here.
+
+    If `class_name` is given, only considers a `function name(` that comes
+    after that class's own `class Name` declaration - guards against
+    matching a same-named method on a different class earlier in the file.
+    """
+    search_from = 0
+    if class_name:
+        cls_match = re.search(rf"\bclass\s+{re.escape(class_name)}\b", text)
+        if cls_match:
+            search_from = cls_match.end()
+
+    sig_match = re.search(rf"\bfunction\s+{re.escape(method_name)}\s*\(", text[search_from:])
+    if not sig_match:
+        return None
+    start = search_from + sig_match.start()
+
+    brace_start = text.find("{", start)
+    if brace_start == -1:
+        return None
+    depth = 0
+    end = None
+    for i in range(brace_start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end is None:
+        return None
+
+    snippet = text[start:end]
+    if len(snippet) > _MAX_SOURCE_CHARS:
+        snippet = snippet[:_MAX_SOURCE_CHARS] + "\n... (truncated)"
+    return snippet
+
+
+def _source_code_facts(db_path: str, resolved_file: str, class_name: str | None, method_name: str) -> str:
+    """The actual source code of the method that handles a resolved
+    URL/route - not just "which file/method handles this" but its real
+    logic, so the LLM can explain what it does line-by-line instead of
+    only pointing at it. Best-effort: needs the source tree on disk
+    (_resolve_repo_root - only reliable for dashboard-uploaded repos) and
+    a brace-matching extraction (_extract_method_source), so absence here
+    just means the block is silently omitted, not an error."""
+    root = _resolve_repo_root(db_path)
+    if root is None:
+        return ""
+    src = root / resolved_file
+    if not src.is_file():
+        return ""
+    try:
+        text = src.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    snippet = _extract_method_source(text, method_name, class_name)
+    if not snippet:
+        return ""
+    label = f"{class_name}::{method_name}" if class_name else method_name
+    return f"Actual source code of `{label}` in {resolved_file}:\n```php\n{snippet}\n```"
+
+
+def _file_source_facts(db_path: str, file: str, label: str) -> str:
+    """The actual (whole-file) source of a view/template file, same
+    verbatim-source idiom as _source_code_facts but for a file rather than
+    one method - a view has no single "method" to brace-match, and
+    templates are usually small enough to include whole. Used by
+    _route_facts_and_file so a resolved URL's *view* gets its real markup
+    alongside its controller method, not just the "renders -> file" fact
+    _views_facts already gives; that fact alone can't answer "what does
+    this page actually show/do" the way the real template can."""
+    root = _resolve_repo_root(db_path)
+    if root is None:
+        return ""
+    src = root / file
+    if not src.is_file():
+        return ""
+    try:
+        text = src.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    if len(text) > _MAX_SOURCE_CHARS:
+        text = text[:_MAX_SOURCE_CHARS] + "\n... (truncated)"
+    return f"Actual source code of {label} `{file}`:\n```php\n{text}\n```"
+
+
+def _route_facts_and_file(conn: kuzu.Connection, question: str) -> tuple[str, str | None, dict | None]:
+    """If the question names a URL/path (retrieval.extract_url_or_path),
+    try resolving it to a real Controller file (db.resolve_url) - a URL is
+    the most natural way a real user names a page, and once resolved it
+    feeds `resolved_file` into the same Rules/Data-source/Views blocks that
+    file-name scoping already uses. Returns (route facts block, resolved
+    file or None, resolve_url()'s full result dict or None) - the third
+    element carries {class, method} on to _source_code_facts so a resolved
+    URL question gets the actual method body, not just "this file handles
+    it". Block is empty and file/result are None when nothing URL-shaped
+    is in the question at all, so the caller falls through to
+    find_mentioned_file."""
+    url = extract_url_or_path(question)
+    if not url:
+        return "", None, None
+    result = resolve_url(conn, url)
+    if result.get("resolved"):
+        block = (f"Graph facts - `{url}` matches route `{result['matched_pattern']}` -> "
+                 f"{result['class']}::{result['method']} ({result['file']}).")
+        return block, result["file"], result
+    if "matched_pattern" in result:
+        block = (f"Note: `{url}` matches route pattern `{result['matched_pattern']}`, but its target "
+                 f"`{result['target']}` wasn't found in the indexed graph (not guessing which class this is).")
+        return block, None, None
+    return f"Note: `{url}` doesn't match any indexed route.", None, None
+
+
+def graph_facts_for_question(conn: kuzu.Connection, question: str, db_path: str = "") -> str:
+    """Router: classify which fact type(s) the question is asking for
+    (retrieval.classify_intents) and which page/file it names - either a
+    URL (db.resolve_url, tried first since that's the most natural way a
+    real user names a page) or a file name (retrieval.find_mentioned_file)
+    - then pull only the relevant deterministic graph fact blocks - so
+    "what roles exist" gets real Concept data, "what rules gate this page"
+    gets real RULE data scoped to that page, etc., instead of everything
+    falling back to docstring similarity the way it used to before this
+    router existed."""
+    intents = classify_intents(question)
+    route_block, resolved_file, route_result = _route_facts_and_file(conn, question)
+    logger.info("graph_facts_for_question: route_result=%r db_path=%r", route_result, db_path)
+    if resolved_file is None and not route_block:
+        resolved_file = find_mentioned_file(question, list_module_files(conn))
+
+    blocks = [_impact_facts(conn, question)]  # always relevant, no intent gate (existing behavior)
+    if route_block:
+        blocks.append(route_block)
+    if route_result:
+        # A resolved URL/route is exactly "the user cares about this one
+        # method's actual logic" - pull its real source, not just the
+        # fact that it's the handler (see the earlier "what handles
+        # /icab/configuration" case - that alone isn't an explanation).
+        src_block = _source_code_facts(db_path, route_result["file"], route_result["class"], route_result["method"])
+        logger.info("graph_facts_for_question: source block chars=%d", len(src_block))
+        blocks.append(src_block)
+
+        # Whatever view(s) that controller method renders are just as much
+        # "the page" as the controller itself - pull their real markup too
+        # (not gated behind the "views" intent keyword: a bare URL like
+        # "/icab/configuration, what does it do" should still get the
+        # actual template, not just the controller). Best-effort: only
+        # fires for the views RENDERS actually resolved to a real Module.
+        for view_row in get_views_rendered(conn, route_result["file"]):
+            target = view_row.get("target_file")
+            if not target:
+                continue
+            view_block = _file_source_facts(db_path, target, f"view `{view_row['view_arg']}`")
+            if view_block:
+                blocks.append(view_block)
+    if "roles" in intents:
+        blocks.append(_roles_facts(conn))
+    if "rules" in intents:
+        blocks.append(_rules_facts(conn, resolved_file))
+    if "inherits" in intents:
+        blocks.append(_inherits_facts(conn, question))
+    if "data_source" in intents:
+        blocks.append(_data_source_facts(conn, db_path, resolved_file))
+    if "matrix" in intents:
+        blocks.append(_matrix_facts(conn))
+    if "views" in intents:
+        blocks.append(_views_facts(conn, resolved_file))
+
+    return "\n\n".join(b for b in blocks if b)
+
+
 def _call_groq(system_prompt: str, user_prompt: str, model: str | None,
                 history: list[dict] | None = None, json_mode: bool = False) -> str:
     """history entries are {"question", "answer"} pairs - "answer" here
@@ -1123,8 +1785,10 @@ def _call_groq(system_prompt: str, user_prompt: str, model: str | None,
     text). _summarize doesn't need this - plain prose is fine there."""
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
+        logger.error("Groq call aborted: GROQ_API_KEY not set on the server process.")
         raise RuntimeError("GROQ_API_KEY not set on the server process - export it and restart `serve`.")
 
+    import urllib.error
     import urllib.request
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -1135,8 +1799,9 @@ def _call_groq(system_prompt: str, user_prompt: str, model: str | None,
             messages.append({"role": "assistant", "content": a})
     messages.append({"role": "user", "content": user_prompt})
 
+    resolved_model = model or "openai/gpt-oss-120b"
     payload = {
-        "model": model or "llama-3.3-70b-versatile",
+        "model": resolved_model,
         "messages": messages,
     }
     if json_mode:
@@ -1152,9 +1817,123 @@ def _call_groq(system_prompt: str, user_prompt: str, model: str | None,
             "User-Agent": "gitnexus-py/1.0",
         },
     )
-    with urllib.request.urlopen(req) as resp:
-        result = json.loads(resp.read())
+    logger.info("Groq request: model=%s prompt_chars=%d history_turns=%d",
+                resolved_model, len(user_prompt), len(history or []))
+    try:
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        # str(exc) alone is just "HTTP Error 404: Not Found" - useless for
+        # diagnosis. Groq's actual error body (e.g. {"error": {"message":
+        # "model `x` does not exist or you do not have access to it", ...}})
+        # is on exc.read() and only readable once, here - log it AND fold
+        # it into the raised message so it also reaches the browser instead
+        # of vanishing into the generic exception text.
+        body = exc.read().decode("utf-8", errors="replace")
+        logger.error("Groq call failed: HTTP %s model=%s body=%s", exc.code, resolved_model, body)
+        raise RuntimeError(f"Groq API error {exc.code} (model={resolved_model}): {body}") from exc
+    except urllib.error.URLError as exc:
+        logger.error("Groq call failed: network error model=%s reason=%s", resolved_model, exc.reason)
+        raise RuntimeError(f"Could not reach Groq's API ({exc.reason}) - check network/proxy access "
+                            f"to api.groq.com.") from exc
+    logger.info("Groq response ok: model=%s", resolved_model)
     return result["choices"][0]["message"]["content"]
+
+
+# Verified against Gemini's live ListModels endpoint (the same discipline
+# that caught Groq's silently-deprecated default model earlier this
+# session) - gemini-2.0-flash, the first guess, isn't even in the catalog
+# anymore. gemini-2.5-flash is: stable (not a -preview/-latest alias),
+# supports generateContent + image input. Override via GEMINI_MODEL if
+# this goes stale too.
+def _generate_chat_title(question: str, answer: str, model: str | None = None) -> str:
+    """LLM-summarized chat title (ChatGPT-style) for a new chat's first
+    turn, so the sidebar shows a short readable label instead of the raw
+    (possibly long, or image-only) question text - see /api/chat-messages.
+    Returns "" on any failure (Groq unreachable, GROQ_API_KEY unset, ...);
+    add_message() then falls back to plain truncation - a nice title is
+    never worth failing the actual answer over."""
+    try:
+        raw = _call_groq(
+            "You title chat conversations. Given the user's question (and the assistant's "
+            "answer, for context), reply with ONLY a short title for this chat: 3-6 words, "
+            "no surrounding quotes, no trailing punctuation, no leading article "
+            "('The'/'A'/'An').",
+            f"Question: {question or '(user sent an image)'}\n\nAnswer: {(answer or '')[:500]}",
+            model,
+        )
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        logger.warning("Chat title generation failed, falling back to truncation: %s", exc)
+        return ""
+    return raw.strip().strip('"').strip("'")[:80]
+
+
+_GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
+
+
+def _call_gemini_describe(image_b64: str, image_mime: str) -> str:
+    """Gemini's one job in this pipeline: turn a screenshot into plain text
+    describing anything that could identify a page/file in the codebase -
+    visible titles, labels, form fields, error text, a URL if visible. That
+    text then flows into the *existing* text-only Ask pipeline (_ask) as if
+    the user had typed it - Gemini never touches graph facts or the final
+    answer, Groq (already working, already tested) still owns those. Groq's
+    own catalog has no vision-capable model (checked against its live
+    /models endpoint this session), which is the actual reason this exists
+    at all."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        logger.error("Gemini call aborted: GEMINI_API_KEY not set on the server process.")
+        raise RuntimeError("GEMINI_API_KEY not set on the server process - add it to .env and restart `serve`.")
+
+    import urllib.error
+    import urllib.request
+
+    model = os.environ.get("GEMINI_MODEL") or _GEMINI_DEFAULT_MODEL
+    prompt = (
+        "This is a screenshot from a web application. Describe, in plain text, only what could "
+        "help identify which page/file in a codebase this is: any visible page title, headings, "
+        "form field labels, button text, table column names, error messages, and the URL if one "
+        "is visible in the browser chrome. Do not describe colors, layout, or general design - "
+        "just the identifying text content, as a short paragraph."
+    )
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": image_mime, "data": image_b64}},
+            ]
+        }]
+    }
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": "gitnexus-py/1.0"},
+    )
+    logger.info("Gemini request: model=%s image_mime=%s image_b64_chars=%d", model, image_mime, len(image_b64))
+    try:
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        # Same lesson as _call_groq: str(exc) drops the actual response
+        # body, which is exactly where Gemini explains a bad model id, a
+        # disabled API, or a bad key - log and surface it instead of the
+        # generic "HTTP Error NNN" text.
+        body = exc.read().decode("utf-8", errors="replace")
+        logger.error("Gemini call failed: HTTP %s model=%s body=%s", exc.code, model, body)
+        raise RuntimeError(f"Gemini API error {exc.code} (model={model}): {body}") from exc
+    except urllib.error.URLError as exc:
+        logger.error("Gemini call failed: network error model=%s reason=%s", model, exc.reason)
+        raise RuntimeError(f"Could not reach Gemini's API ({exc.reason}) - check network/proxy access "
+                            f"to generativelanguage.googleapis.com.") from exc
+
+    try:
+        text = result["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError) as exc:
+        logger.error("Gemini call failed: unexpected response shape: %s", result)
+        raise RuntimeError(f"Gemini returned an unexpected response shape: {result}") from exc
+    logger.info("Gemini response ok: model=%s extracted_chars=%d", model, len(text))
+    return text
 
 
 def _top_folder(file_path: str) -> str:
@@ -1233,12 +2012,12 @@ def build_context(conn: kuzu.Connection, question: str, top_k: int = 15) -> list
 
 
 def _ask(conn: kuzu.Connection, question: str, model: str | None,
-         history: list[dict] | None = None) -> dict:
+         history: list[dict] | None = None, db_path: str = "") -> dict:
     if not question.strip():
         return {"error": "empty question"}
 
     context_rows = build_context(conn, question, top_k=15)
-    graph_facts = graph_facts_for_question(conn, question)
+    graph_facts = graph_facts_for_question(conn, question, db_path=db_path)
 
     parts = []
     if graph_facts:
@@ -1249,10 +2028,25 @@ def _ask(conn: kuzu.Connection, question: str, model: str | None,
 
     system_prompt = (
         "You are a code assistant. Answer using only the provided graph context. When "
-        "'Graph facts' are given, they come from a real call-graph traversal (exact, not "
-        "guessed) - trust them over anything else for who-calls-what / change-impact "
-        "questions. Earlier turns in this conversation may be included for context - prefer "
-        "the fresh graph context above over older answers if they conflict.\n\n"
+        "'Graph facts' are given, they come from real graph data (Roles/RULEs extracted "
+        "deterministically from the code, a real call-graph/INHERITS traversal, or a resolved "
+        "Route/Render match) - exact, not guessed - trust them over anything else for roles, "
+        "access rules, who-calls-what, change-impact, inheritance (both 'X extends' and 'what "
+        "extends X'), URL-to-page routing, and view-rendering questions. A block starting with "
+        "'Evidence for data sources' is different: it's a best-effort regex scan of the page's "
+        "raw source, not a resolved trace, so state it with appropriate hedging (e.g. \"the "
+        "file references X, Y\") rather than as a certain, complete answer. A block titled "
+        "'Actual source code of ...' is the real method body or view/template file, verbatim - "
+        "when it's present, use it to explain what the code actually *does* (its real logic or "
+        "markup, step by step, in plain English) instead of only naming which method/file "
+        "handles the request; that's the whole point of including it. When both a controller "
+        "method and a view file are given for the same resolved URL, weave them together into "
+        "one end-to-end explanation (what the controller computes, what the view then renders "
+        "with it) rather than describing them as two disconnected facts. A 'Note:' block "
+        "(e.g. a route pattern matched but its target class wasn't found in the graph) should "
+        "also be stated as the honest limitation it is, not smoothed over. Earlier turns in "
+        "this conversation may be included for context - prefer the fresh graph context above "
+        "over older answers if they conflict.\n\n"
         "Respond with a JSON object: "
         "{\"type\": \"answer\" or \"clarify\", \"content\": \"...\", \"detail\": \"...\"}.\n"
         "- Use \"answer\" when the context gives you enough to respond confidently. Never "
@@ -1279,6 +2073,28 @@ def _ask(conn: kuzu.Connection, question: str, model: str | None,
     raw = _call_groq(system_prompt, f"Codebase graph context:\n{context}\n\nQuestion: {question}",
                       model, history, json_mode=True)
     return _parse_ask_response(raw)
+
+
+def _ask_with_image(conn: kuzu.Connection, question: str, image_b64: str, image_mime: str,
+                     model: str | None, history: list[dict] | None = None, db_path: str = "") -> dict:
+    """Image variant of _ask: Gemini turns the screenshot into text
+    (_call_gemini_describe), then that text is handed to the *unmodified*
+    _ask() exactly like a typed question - every existing capability (URL
+    resolution, roles/rules/routes/views/actual-source-code blocks, Groq
+    answer synthesis) applies to it for free. If the user also typed
+    something, it's kept alongside the extracted description rather than
+    replaced by it."""
+    extracted = _call_gemini_describe(image_b64, image_mime)
+    synthesized = f"{question.strip()}\n\n[Image content]: {extracted}" if question.strip() else extracted
+    result = _ask(conn, synthesized, model, history, db_path=db_path)
+    # Carry the Gemini-extracted description back to the caller so it can be
+    # stored as this turn's *context* question (see chat_store.add_message's
+    # context_question column and sendAsk's use of it in web.py's HTML/JS).
+    # Without this, a follow-up turn's history only replays the original
+    # raw question (often just "(image)") and the image's content is lost
+    # from the conversation after this one turn.
+    result["resolved_question"] = synthesized
+    return result
 
 
 def _parse_ask_response(raw: str) -> dict:
@@ -1314,10 +2130,13 @@ def run_server(db_path: str, host: str = "127.0.0.1", port: int = 8765,
     url = f"http://{host}:{port}/"
     if open_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
-    print(f"gitnexus-py dashboard running at {url} (Ctrl+C to stop)")
+    log_path = Path.cwd() / "gitnexus_py.log"
+    print(f"gitnexus-py dashboard running at {url} (Ctrl+C to stop) - logging to {log_path}")
+    logger.info("serve started: db=%s host=%s port=%s pid=%s", db_path, host, port, os.getpid())
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        logger.info("serve stopped")
         httpd.server_close()

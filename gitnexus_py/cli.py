@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pandas as pd
 import typer
@@ -22,13 +23,38 @@ from rich.console import Console
 from rich.table import Table
 
 from .db import (open_db, load_graph, delete_files, export_graph_json, get_callers, get_impact,
-                 load_concepts, load_rules, list_concepts, get_concept_rules, ensure_vector_index)
+                 load_concepts, load_rules, list_concepts, get_concept_rules, ensure_vector_index,
+                 load_routes, list_routes, resolve_url, load_renders)
 from .embeddings import is_available as embeddings_available
 from .parser import parse_repo, discover_python_files, discover_php_files, compute_file_hashes
 from .viz import render_html
 from .obsidian import export_vault
 from .web import run_server, _ask
-from . import rbac_extractor
+from . import rbac_extractor, route_extractor, view_extractor
+
+
+def _load_dotenv(path: str = ".env") -> None:
+    """Minimal stdlib-only `.env` loader (no python-dotenv dependency,
+    consistent with the project's zero-extra-infra style) - so
+    GROQ_API_KEY (and anything else) can live in a gitignored .env file
+    next to the CLI instead of being exported by hand every session.
+    KEY=value lines only, '#' comments and blank lines skipped. A real
+    environment variable that's already set always wins - .env only fills
+    in what's missing, it never overrides."""
+    p = Path(path)
+    if not p.is_file():
+        return
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
 
 app = typer.Typer(add_completion=False, help="GitNexus-py: local code knowledge graph")
 console = Console()
@@ -112,6 +138,17 @@ def index(
         load_concepts(conn, concepts)
         load_rules(conn, rules)
         console.print(f"  found {len(concepts)} concept(s), {len(rules)} rule(s)")
+
+        console.print("[bold]Extracting routes[/bold] ...")
+        routes = route_extractor.extract(repo_path, php_files)
+        load_routes(conn, routes)
+        console.print(f"  found {len(routes)} route(s)")
+
+        console.print("[bold]Extracting view-render facts[/bold] ...")
+        renders = view_extractor.extract(repo_path, php_files)
+        load_renders(conn, renders)
+        resolved_count = sum(1 for r in renders if r["resolved"])
+        console.print(f"  found {len(renders)} render call(s), {resolved_count} resolved")
 
     if incremental:
         with open(manifest_file, "w", encoding="utf-8") as fh:
@@ -265,9 +302,45 @@ def roles(
 
 
 @app.command()
+def routes(
+    url: str = typer.Option(None, "--url", help="Resolve one URL/path to its Controller (omit to list every route)"),
+    db: str = typer.Option(DEFAULT_DB, "--db"),
+):
+    """Deterministic, no-LLM answer to "what routes/pages exist" or "what
+    handles this URL": lists every Route extracted by route_extractor.py
+    (both explicitly declared and convention-generated), or (with --url)
+    resolves one real URL to its Controller/method via resolve_url()."""
+    _, conn = open_db(db, fresh=False)
+    if url:
+        result = resolve_url(conn, url)
+        if not result.get("resolved"):
+            if "matched_pattern" in result:
+                console.print(f"[yellow]Matched route pattern[/yellow] {result['matched_pattern']}, "
+                               f"but couldn't resolve target [bold]{result['target']}[/bold] to an indexed file.")
+            else:
+                console.print(f"No route pattern matches [bold]{url}[/bold].")
+            return
+        console.print(f"[green]{result['matched_pattern']}[/green] -> "
+                       f"{result['class']}::{result['method']} ({result['file']})")
+        return
+
+    rows = list_routes(conn)
+    if not rows:
+        console.print("No routes extracted - run `index` on a repo with a PHP Routes.php first.")
+        return
+    table = Table(title="Routes")
+    for col in ("http_method", "pattern", "target", "kind", "source_file", "lineno"):
+        table.add_column(col)
+    for r in rows:
+        table.add_row(str(r["http_method"]), str(r["pattern"]), str(r["target"]),
+                       str(r["kind"]), str(r["source_file"]), str(r["lineno"]))
+    console.print(table)
+
+
+@app.command()
 def ask(question: str = typer.Argument(..., help="Natural language question about the codebase"),
         db: str = typer.Option(DEFAULT_DB, "--db"),
-        model: str = typer.Option("llama-3.3-70b-versatile", "--model")):
+        model: str = typer.Option("openai/gpt-oss-120b", "--model")):
     """Ask a natural-language question; pulls relevant graph context and
     sends it to Groq's LLM API (set GROQ_API_KEY env var to use this).
     This mirrors GitNexus's Graph RAG agent, just via a REST call instead
@@ -286,7 +359,7 @@ def ask(question: str = typer.Argument(..., help="Natural language question abou
     history: list[dict] = []
     current = question
     while True:
-        result = _ask(conn, current, model, history)
+        result = _ask(conn, current, model, history, db_path=db)
         if "error" in result:
             console.print(f"[red]{result['error']}[/red]")
             raise typer.Exit(1)
